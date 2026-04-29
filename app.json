@@ -1,0 +1,41 @@
+{
+  "expo": {
+    "name": "Cipher",
+    "slug": "cipher",
+    "version": "1.0.0",
+    "sdkVersion": "54.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "backgroundColor": "#05070d"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.cipher.app",
+      "infoPlist": {
+        "UIBackgroundModes": ["remote-notification"]
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#05070d"
+      },
+      "package": "com.cipher.app",
+      "softwareKeyboardLayoutMode": "pan"
+    },
+    "plugins": [
+      "expo-font",
+      "expo-asset",
+      [
+        "expo-notifications",
+        {
+          "color": "#22d3ee"
+        }
+      ]
+    ],
+    "notification": {
+      "color": "#22d3ee",
+      "iosDisplayInForeground": false
+    }
+  }
+}

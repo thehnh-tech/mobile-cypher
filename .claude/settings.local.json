@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:api.anthropic.com)",
+      "Bash(gunzip -c webfetch-1777138360916-qgnha6.bin)",
+      "Bash(python3 -c \"import gzip,sys; data=open\\('webfetch-1777138360916-qgnha6.bin','rb'\\).read\\(\\); print\\(gzip.decompress\\(data\\).decode\\('utf-8','ignore'\\)[:5000]\\)\")",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -u -c ' *)",
+      "Bash(npm install *)",
+      "Bash(npx tsc *)",
+      "Bash(node -e \"const p=require\\('./node_modules/@noble/hashes/package.json'\\); console.log\\('@noble/hashes', p.version\\)\")",
+      "Bash(node -e \"const p=require\\('./node_modules/@noble/ciphers/package.json'\\); console.log\\('@noble/ciphers', p.version\\)\")",
+      "Bash(node -e \"const {sha256}=require\\('@noble/hashes/sha2'\\); const {pbkdf2}=require\\('@noble/hashes/pbkdf2'\\); const {gcm}=require\\('@noble/ciphers/aes'\\); console.log\\('sha256:', typeof sha256, 'pbkdf2:', typeof pbkdf2, 'gcm:', typeof gcm\\)\")",
+      "Bash(node -e ' *)",
+      "Bash(npx expo *)",
+      "Bash(npx kill-port *)",
+      "Bash(node -e \"console.log\\(require\\('./node_modules/expo/package.json'\\).version\\)\")",
+      "Bash(npm show *)",
+      "Bash(node -e \"const v=JSON.parse\\(require\\('fs'\\).readFileSync\\('/dev/stdin','utf8'\\)\\); const sdk53=v.filter\\(x=>x.startsWith\\('53.'\\)\\); console.log\\('Latest SDK 53:', sdk53[sdk53.length-1]\\)\")",
+      "Bash(node *)",
+      "Bash(npm run *)",
+      "Bash(curl *)",
+      "PowerShell(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notmatch 'Loopback|Virtual|Hyper-V|WSL' -and $_.IPAddress -ne '127.0.0.1' } | Select-Object IPAddress, InterfaceAlias)",
+      "Bash(netstat -ano)",
+      "Bash(tasklist)",
+      "PowerShell(Get-NetTCPConnection *)",
+      "PowerShell(Stop-Process *)",
+      "PowerShell(try { $r = Invoke-WebRequest -Uri http://172.20.10.9:3000/health -UseBasicParsing -TimeoutSec 5; \"HEALTH: \" + $r.StatusCode + \" \" + $r.Content } catch { \"HEALTH ERROR: \" + $_.Exception.Message })",
+      "PowerShell(try { $r = Invoke-WebRequest -Uri http://172.20.10.9:3000/health -UseBasicParsing -TimeoutSec 10; \"LAN: \" + $r.StatusCode + \" \" + $r.Content } catch { \"LAN err: \" + $_.Exception.Message })",
+      "PowerShell(try { $r = Invoke-WebRequest -Uri http://172.20.10.9:3000/health -UseBasicParsing -TimeoutSec 6; \"HEALTH: \" + $r.StatusCode + \" \" + $r.Content } catch { \"ERR: \" + $_.Exception.Message })",
+      "PowerShell(try { $r = Invoke-WebRequest -Uri http://localhost:3000/health -UseBasicParsing -TimeoutSec 5; \"OK: \" + $r.Content } catch { \"ERR: \" + $_.Exception.Message })",
+      "Bash(grep -n \"compressPNG\\\\|compress = function\\\\|encode\\\\\\\\.compress\" C:/Users/Hedi/Documents/Dev/Chat-System/node_modules/upng-js/UPNG.js)",
+      "PowerShell(try { $r = Invoke-WebRequest -Uri http://172.20.10.9:3000/health -UseBasicParsing -TimeoutSec 8; \"HEALTH OK: \" + $r.Content } catch { \"HEALTH ERR: \" + $_.Exception.Message }; try { $r2 = Invoke-WebRequest -Uri http://localhost:3000/health -UseBasicParsing -TimeoutSec 8; \"LOCAL OK: \" + $r2.Content } catch { \"LOCAL ERR: \" + $_.Exception.Message })",
+      "Bash(grep -rn \"Object\\\\\\\\.keys\\\\\\\\|Object\\\\\\\\.values\\\\\\\\|Object\\\\\\\\.assign\\\\\\\\|Object\\\\\\\\.entries\" C:/Users/Hedi/Documents/Dev/Chat-System/node_modules/pako/)",
+      "PowerShell(try { $r = Invoke-WebRequest -Uri http://172.20.10.9:3000/health -UseBasicParsing -TimeoutSec 5; \"OK: \" + $r.Content } catch { \"ERR: \" + $_.Exception.Message })",
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(grep -E \"\\\\.env$|node_modules|\\\\.expo\")"
+    ]
+  }
+}
