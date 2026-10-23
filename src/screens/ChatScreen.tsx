@@ -3,7 +3,7 @@ import { usePreventScreenCapture, addScreenshotListener } from 'expo-screen-capt
 import {
   View, Text, FlatList, StyleSheet, TouchableOpacity,
   TextInput, KeyboardAvoidingView, Platform, Modal,
-  Pressable, Animated,
+  Pressable, Animated, Alert,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StackNavigationProp } from '@react-navigation/stack';
@@ -26,6 +26,7 @@ import {
 } from '../components/Icons';
 import { getAIReply, isAIError } from '../aiClient';
 import { api, ServerConversation, ServerMessage } from '../api';
+import { appendChatMessage } from '../vaultUpdates';
 
 type Props = {
   navigation: StackNavigationProp<MainStackParams, 'Chat'>;
@@ -237,6 +238,8 @@ export default function ChatScreen({ navigation, route }: Props) {
   const [replyingTo, setReplyingTo] = useState<Message | null>(null);
   const [actionMsg, setActionMsg] = useState<Message | null>(null);
   const [aiTyping, setAiTyping] = useState(false);
+  const [aiConsent, setAiConsent] = useState(false);
+  const localSendingRef = useRef(false);
   const [serverMessages, setServerMessages] = useState<Message[]>([]);
   const flatListRef = useRef<FlatList>(null);
   const [systemEvents, setSystemEvents] = useState<SysEvent[]>([]);
@@ -351,9 +354,15 @@ export default function ChatScreen({ navigation, route }: Props) {
 
   // ── Send handlers ───────────────────────────────────────────
   const sendLocalMessage = useCallback(async () => {
-    if (!localChat) return;
+    if (!localChat || localSendingRef.current || !token) return;
+    if (isAI && (!aiConsent || !token)) return;
     const text = inputText.trim();
     if (!text) return;
+    if (isAI && text.length > 4000) {
+      Alert.alert('Message too long', 'AI messages can contain at most 4000 characters. Your message has not been sent.');
+      return;
+    }
+    const origin = { userId: vault.profile.id, token };
 
     const newMsg: Message = {
       id: randomId(),
@@ -375,57 +384,79 @@ export default function ChatScreen({ navigation, route }: Props) {
         : {}),
     };
 
-    const updatedChats = vault.chats.map((c) => {
-      if (c.id !== localChat.id) return c;
-      return { ...c, messages: [...c.messages, newMsg], unread: 0 };
-    });
-
     setInputText('');
     setReplyingTo(null);
-    await updateVault({ ...vault, chats: updatedChats });
+    localSendingRef.current = true;
+    if (isAI) setAiTyping(true);
+    let requestMessages: Message[] = [];
+    try {
+      const saved = await updateVault((latest) => {
+        const updated = appendChatMessage(latest, localChat.id, newMsg);
+        requestMessages = updated.chats.find((chat) => chat.id === localChat.id)?.messages ?? [];
+        return updated;
+      }, origin);
+      if (!saved) {
+        localSendingRef.current = false;
+        setAiTyping(false);
+        return;
+      }
+    } catch {
+      localSendingRef.current = false;
+      setAiTyping(false);
+      setInputText(text);
+      Alert.alert('Message not saved', 'Please try again.');
+      return;
+    }
     scrollToEnd();
 
     if (isAI && localContact) {
       setAiTyping(true);
       scrollToEnd();
+      let responseMessage: Message;
       try {
         const replyText = await getAIReply(
-          [...localChat.messages, newMsg],
+          requestMessages,
           vault.profile.id,
           localContact.id,
-          vault.settings.aiApiKey,
+          token!,
+          (notice) => setSystemEvents((previous) => [...previous, {
+            _isSystem: true, id: randomId(), text: notice, ts: Date.now(),
+          }]),
         );
-        const aiMsg: Message = {
+        responseMessage = {
           id: randomId(),
           from: localContact.id,
           text: replyText,
           ts: Date.now(),
         };
-        const withAI = updatedChats.map((c) => {
-          if (c.id !== localChat.id) return c;
-          return { ...c, messages: [...c.messages, aiMsg] };
-        });
-        setAiTyping(false);
-        await updateVault({ ...vault, chats: withAI });
-        scrollToEnd();
       } catch (e) {
         setAiTyping(false);
         const errText = isAIError(e) ? `[AI error: ${e.message}]` : '[AI failed to respond]';
-        const errMsg: Message = {
+        responseMessage = {
           id: randomId(),
           from: localContact.id,
           text: errText,
           ts: Date.now(),
         };
-        const withErr = updatedChats.map((c) => {
-          if (c.id !== localChat.id) return c;
-          return { ...c, messages: [...c.messages, errMsg] };
-        });
-        await updateVault({ ...vault, chats: withErr });
-        scrollToEnd();
       }
+      try {
+        const saved = await updateVault(
+          (latest) => appendChatMessage(latest, localChat.id, responseMessage), origin,
+        );
+        if (saved) scrollToEnd();
+      } catch {
+        setSystemEvents((previous) => [...previous, {
+          _isSystem: true, id: randomId(),
+          text: 'The AI response could not be saved. Please try again.', ts: Date.now(),
+        }]);
+      } finally {
+        localSendingRef.current = false;
+        setAiTyping(false);
+      }
+    } else {
+      localSendingRef.current = false;
     }
-  }, [inputText, replyingTo, vault, localChat, isAI, localContact, updateVault, scrollToEnd]);
+  }, [inputText, replyingTo, vault, localChat, isAI, localContact, updateVault, scrollToEnd, aiConsent, token]);
 
   const sendServerMessage = useCallback(async () => {
     if (!serverConv || !token) return;
@@ -626,7 +657,7 @@ export default function ChatScreen({ navigation, route }: Props) {
             <View style={styles.headerSub}>
               <ShieldIcon color={theme.accent} size={9} />
               <Text style={[styles.headerSubText, { color: theme.accent, fontFamily: FONTS.mono }]}>
-                encrypted
+                {isAI ? 'processed by Groq' : 'encrypted'}
               </Text>
               {localContact?.online && (
                 <View style={[styles.onlineDot, { backgroundColor: '#4ade80' }]} />
@@ -634,6 +665,19 @@ export default function ChatScreen({ navigation, route }: Props) {
             </View>
           </View>
         </View>
+
+        {isAI && (
+          <View style={{ padding: 12, backgroundColor: theme.surface1 }}>
+            <Text style={{ color: theme.textDim, fontFamily: FONTS.body, fontSize: 12 }}>
+              Sending to AI shares up to 20 recent messages from this chat with the app's server and Groq. Older context may be omitted to fit its limits; a notice appears when this happens. Both services can read these messages for processing; this is not end-to-end encrypted.
+            </Text>
+            {!aiConsent && (
+              <TouchableOpacity onPress={() => setAiConsent(true)} style={{ paddingVertical: 10 }}>
+                <Text style={{ color: theme.accent, fontFamily: FONTS.bodySemiBold }}>I understand — enable AI chat</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        )}
 
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : undefined}
@@ -731,6 +775,7 @@ export default function ChatScreen({ navigation, route }: Props) {
               placeholder="Message…"
               placeholderTextColor={theme.textDim}
               multiline
+              maxLength={isAI ? 4000 : undefined}
               underlineColorAndroid="transparent"
               autoCorrect={false}
               style={[styles.input, { color: theme.text, fontFamily: FONTS.body, borderColor: theme.border }]}
@@ -738,7 +783,7 @@ export default function ChatScreen({ navigation, route }: Props) {
             />
             <TouchableOpacity
               onPress={editingMsg ? sendEditedMessage : sendMessage}
-              disabled={!inputText.trim()}
+              disabled={!inputText.trim() || (isAI && (!aiConsent || aiTyping))}
               style={[
                 styles.sendBtn,
                 { backgroundColor: inputText.trim() ? theme.accent : theme.surface2 },

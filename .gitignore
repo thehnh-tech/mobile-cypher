@@ -22,9 +22,11 @@ backend/dist/
 
 # Env / secrets
 .env
-.env.local
-.env.*.local
-backend/.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
 
 # Logs
 npm-debug.*

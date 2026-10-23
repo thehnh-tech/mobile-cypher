@@ -5,6 +5,13 @@ import { EncryptedBlob } from './crypto';
 
 const BASE_URL = process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:3000';
 
+export class ApiError extends Error {
+  constructor(public readonly status: number, message: string) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
 interface RequestOpts {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
   body?: unknown;
@@ -12,18 +19,27 @@ interface RequestOpts {
 }
 
 async function request<T>(path: string, opts: RequestOpts = {}): Promise<T> {
+  if (!__DEV__ && !BASE_URL.startsWith('https://')) {
+    throw new Error('Production builds require an HTTPS backend URL.');
+  }
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (opts.token) headers.Authorization = `Bearer ${opts.token}`;
 
   let res: Response;
+  // Long polling waits up to 25 seconds; allow it to finish while bounding outages.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 40_000);
   try {
     res = await fetch(`${BASE_URL}${path}`, {
       method: opts.method ?? 'GET',
       headers,
       body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+      signal: controller.signal,
     });
   } catch (e: any) {
     throw new Error(`Network error reaching backend at ${BASE_URL}: ${e?.message ?? e}`);
+  } finally {
+    clearTimeout(timeout);
   }
 
   let data: any = {};
@@ -35,7 +51,7 @@ async function request<T>(path: string, opts: RequestOpts = {}): Promise<T> {
 
   if (!res.ok) {
     const msg = data?.error ?? `HTTP ${res.status}`;
-    throw new Error(msg);
+    throw new ApiError(res.status, msg);
   }
   return data as T;
 }
@@ -51,6 +67,7 @@ export interface SignupBody {
   verifier: EncryptedBlob;
   fingerprint: string;
   publicKey: string;
+  authCredential: string;
 }
 
 export interface SignupResp {
@@ -128,13 +145,21 @@ export interface SyncResp {
 }
 
 export const api = {
+  aiChat: (token: string, messages: { role: 'user' | 'assistant'; content: string }[]) =>
+    request<{ content: string }>('/ai/chat', { method: 'POST', token, body: { messages } }),
+
   health: () => request<{ status: string; ts: number }>('/health'),
 
   signup: (body: SignupBody) =>
     request<SignupResp>('/auth/signup', { method: 'POST', body }),
 
-  login: (username: string) =>
-    request<LoginResp>('/auth/login', { method: 'POST', body: { username } }),
+  authParameters: (username: string) =>
+    request<{ salt: string; verifier: EncryptedBlob }>('/auth/parameters', {
+      method: 'POST', body: { username },
+    }),
+
+  login: (username: string, authCredential: string) =>
+    request<LoginResp>('/auth/login', { method: 'POST', body: { username, authCredential } }),
 
   getVault: (token: string) =>
     request<{ encryptedBlob: string; updatedAt: string }>('/vault', { token }),

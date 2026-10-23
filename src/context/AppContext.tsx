@@ -9,6 +9,7 @@ import { api, ServerRequest, ServerConversation } from '../api';
 import { randomId } from '../crypto';
 import { ToastHost, ToastItem } from '../components/Toast';
 import { registerForPushNotificationsAsync } from '../pushNotifications';
+import { createVaultUpdater, mergeVaultChanges, VaultUpdate, VaultSessionIdentity } from '../vaultUpdates';
 
 interface AppState {
   isLoading: boolean;
@@ -30,7 +31,7 @@ interface AppContextValue extends AppState {
   login: (username: string, password: string) => Promise<void>;
   signup: (username: string, password: string, displayName: string, tag: string) => Promise<void>;
   logout: () => Promise<void>;
-  updateVault: (vault: Vault) => Promise<void>;
+  updateVault: (update: VaultUpdate, expectedSession?: VaultSessionIdentity) => Promise<boolean>;
   setTheme: (name: ThemeName) => void;
   // Server messaging surface
   serverRequests: ServerRequest[];
@@ -60,6 +61,30 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     vault: null,
     theme: THEMES.cyan,
   });
+  const stateRef = useRef(state);
+  const tokenRef = useRef<string | null>(null);
+  const applyState = useCallback((update: AppState | ((previous: AppState) => AppState)) => {
+    const next = typeof update === 'function' ? update(stateRef.current) : update;
+    stateRef.current = next;
+    tokenRef.current = next.token;
+    setState(next);
+  }, []);
+
+  const vaultUpdaterRef = useRef<ReturnType<typeof createVaultUpdater> | null>(null);
+  if (!vaultUpdaterRef.current) {
+    vaultUpdaterRef.current = createVaultUpdater({
+      current: () => {
+        const current = stateRef.current;
+        return current.userId && current.token && current.key && current.vault
+          ? { userId: current.userId, token: current.token, key: current.key, vault: current.vault }
+          : null;
+      },
+      save: (session, vault) => DB.saveVault(session.userId, vault, session.key, session.token),
+      commit: (vault) => applyState((current) => ({
+        ...current, vault, theme: THEMES[vault.settings.theme as ThemeName] ?? current.theme,
+      })),
+    });
+  }
 
   const [server, setServer] = useState<ServerState>({
     requests: [],
@@ -74,11 +99,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const unlock = useCallback(() => setIsLocked(false), []);
   const lockNow = useCallback(() => setIsLocked(true), []);
 
-  const tokenRef = useRef<string | null>(null);
   const lastSyncRef = useRef<string | null>(null);
   const isFirstSyncRef = useRef(true);
   const expoPushTokenRef = useRef<string | null>(null);
-  tokenRef.current = state.token;
   lastSyncRef.current = server.lastSync;
 
   const registerPush = useCallback(async (apiToken: string) => {
@@ -97,7 +120,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       .then((session) => {
         if (session) {
           const themeName = (session.vault.settings?.theme as ThemeName) ?? 'cyan';
-          setState({
+          applyState({
             isLoading: false,
             isAuthenticated: true,
             userId: session.userId,
@@ -108,11 +131,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           });
           void registerPush(session.token);
         } else {
-          setState((s) => ({ ...s, isLoading: false }));
+          applyState((s) => ({ ...s, isLoading: false }));
         }
       })
-      .catch(() => setState((s) => ({ ...s, isLoading: false })));
-  }, [registerPush]);
+      .catch(() => applyState((s) => ({ ...s, isLoading: false })));
+  }, [registerPush, applyState]);
 
   const pushToast = useCallback((text: string, kind: ToastItem['kind'] = 'info') => {
     const id = randomId();
@@ -128,6 +151,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     try {
       const since = lastSyncRef.current ?? undefined;
       const resp = await api.sync(token, since);
+      if (tokenRef.current !== token) return;
 
       // In-app toast: only for new requests. New-message popups belong to
       // OS push notifications (when the app is closed) — not in-app.
@@ -203,7 +227,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     await DB.persistSession(user.id, key, token);
     const themeName = (vault.settings?.theme as ThemeName) ?? 'cyan';
     isFirstSyncRef.current = true;
-    setState({
+    applyState({
       isLoading: false,
       isAuthenticated: true,
       userId: user.id,
@@ -215,14 +239,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     // Just typed the password — that's enough auth for this session.
     setIsLocked(false);
     void registerPush(token);
-  }, [registerPush]);
+  }, [registerPush, applyState]);
 
   const signup = useCallback(
     async (username: string, password: string, displayName: string, tag: string) => {
       const { user, key, vault, token } = await DB.signup({ username, password, displayName, tag });
       await DB.persistSession(user.id, key, token);
       isFirstSyncRef.current = true;
-      setState({
+      applyState({
         isLoading: false,
         isAuthenticated: true,
         userId: user.id,
@@ -237,22 +261,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       setIsLocked(false);
       void registerPush(token);
     },
-    [registerPush],
+    [registerPush, applyState],
   );
 
   const logout = useCallback(async () => {
     const apiToken = tokenRef.current;
     const expoToken = expoPushTokenRef.current;
-    if (apiToken && expoToken) {
-      try {
-        await api.unregisterPushToken(apiToken, expoToken);
-      } catch (e: any) {
-        console.warn('[push] unregister failed:', e?.message ?? e);
-      }
-    }
     expoPushTokenRef.current = null;
-    await DB.clearSession();
-    setState({
+    // Invalidate queued work and hide the vault immediately. Push cleanup must
+    // never hold the user inside an authenticated screen on a slow network.
+    applyState({
       isLoading: false,
       isAuthenticated: false,
       userId: null,
@@ -262,21 +280,32 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       theme: THEMES.cyan,
     });
     setIsLocked(true);
-  }, []);
+    if (apiToken && expoToken) {
+      void api.unregisterPushToken(apiToken, expoToken).catch(() => undefined);
+    }
+    try {
+      await DB.clearSession();
+    } catch {
+      pushToast('Signed out, but saved credentials could not be removed. Clear this app’s device storage before sharing the device.', 'info');
+    } finally {
+      setIsLocked(true);
+    }
+  }, [applyState, pushToast]);
 
   const updateVault = useCallback(
-    async (vault: Vault) => {
-      if (!state.userId || !state.key || !state.token) return;
-      await DB.saveVault(state.userId, vault, state.key, state.token);
-      const themeName = (vault.settings?.theme as ThemeName) ?? 'cyan';
-      setState((s) => ({ ...s, vault, theme: THEMES[themeName] ?? s.theme }));
+    (update: VaultUpdate, expectedSession?: VaultSessionIdentity) => {
+      if (!state.userId || !state.token || !state.vault) return Promise.resolve(false);
+      const origin = expectedSession ?? { userId: state.userId, token: state.token };
+      const base = state.vault;
+      return vaultUpdaterRef.current!(typeof update === 'function' ? update
+        : (latest) => mergeVaultChanges(latest, base, update), origin);
     },
-    [state.userId, state.key, state.token],
+    [state.userId, state.token, state.vault],
   );
 
   const setTheme = useCallback((name: ThemeName) => {
-    setState((s) => ({ ...s, theme: THEMES[name] }));
-  }, []);
+    applyState((s) => ({ ...s, theme: THEMES[name] }));
+  }, [applyState]);
 
   return (
     <AppContext.Provider

@@ -13,7 +13,14 @@ export function authMiddleware(req: AuthedRequest, res: Response, next: NextFunc
     return;
   }
   try {
-    const payload = jwt.verify(header.slice(7), config.jwtSecret) as { userId: string };
+    const payload = jwt.verify(header.slice(7), config.jwtSecret, {
+      algorithms: ['HS256'], issuer: 'cipher-api', audience: 'cipher-client',
+    });
+    // All tokens from the username-only login implementation are revoked.
+    if (typeof payload !== 'object' || payload.authVersion !== 2
+        || typeof payload.userId !== 'string' || !/^[a-f0-9]{24}$/i.test(payload.userId)) {
+      throw new Error('Invalid session');
+    }
     req.userId = payload.userId;
     next();
   } catch {

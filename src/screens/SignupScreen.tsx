@@ -30,7 +30,7 @@ export default function SignupScreen({ navigation }: Props) {
   const passwordsMatch = !confirm || password === confirm;
   const valid =
     username.length >= 3 &&
-    password.length >= 6 &&
+    password.length >= 12 &&
     password === confirm &&
     cleanTag.length >= 3;
 
@@ -118,7 +118,7 @@ export default function SignupScreen({ navigation }: Props) {
                   label="Password"
                   value={password}
                   onChangeText={setPassword}
-                  placeholder="min 6 characters"
+                  placeholder="min 12 characters"
                   secureTextEntry
                   theme={theme}
                 />

@@ -28,7 +28,6 @@ export default function ProfileScreen({ navigation }: Props) {
   const [displayName, setDisplayName] = useState(vault?.profile.displayName ?? '');
   const [bio, setBio] = useState(vault?.profile.bio ?? '');
   const [hue, setHue] = useState(vault?.profile.avatar.hue ?? 160);
-  const [aiKey, setAiKey] = useState(vault?.settings.aiApiKey ?? '');
   const [copied, setCopied] = useState(false);
 
   if (!vault) return null;
@@ -37,7 +36,6 @@ export default function ProfileScreen({ navigation }: Props) {
     const newVault = {
       ...vault,
       profile: { ...vault.profile, displayName, bio, avatar: { hue } },
-      settings: { ...vault.settings, aiApiKey: aiKey.trim() || undefined },
     };
     await updateVault(newVault);
     setEditing(false);
@@ -188,38 +186,13 @@ export default function ProfileScreen({ navigation }: Props) {
             )}
           </View>
 
-          {/* AI API key */}
+          {/* AI privacy */}
           <View style={styles.field}>
-            <Text style={[styles.fieldLabel, { color: theme.textDim, fontFamily: FONTS.mono }]}>
-              Groq API key (AI chat)
+            <Text style={[styles.fieldLabel, { color: theme.textDim, fontFamily: FONTS.mono }]}>AI chat</Text>
+            <Text style={[styles.fieldValue, { color: theme.textDim, fontFamily: FONTS.body }]}>
+              AI is provided through this app's server and Groq. Messages you send to the AI are shared with both services for processing. Provider access is configured by the server operator.
             </Text>
-            {editing ? (
-              <TextInput
-                value={aiKey}
-                onChangeText={setAiKey}
-                placeholder="gsk_… (leave empty to use default)"
-                placeholderTextColor={theme.textDim}
-                autoCapitalize="none"
-                autoCorrect={false}
-                secureTextEntry
-                underlineColorAndroid="transparent"
-                style={[styles.fieldInput, {
-                  color: theme.text,
-                  backgroundColor: theme.surface1,
-                  borderColor: theme.border,
-                  fontFamily: FONTS.mono,
-                  fontSize: 12,
-                }]}
-              />
-            ) : (
-              <View style={[styles.fieldDisplay, { backgroundColor: theme.surface1, borderColor: theme.border }]}>
-                <Text style={[styles.fieldValue, { color: aiKey ? theme.accent : theme.textDim, fontFamily: FONTS.mono, fontSize: 12 }]}>
-                  {aiKey ? `${aiKey.slice(0, 8)}…${aiKey.slice(-4)}` : 'Using built-in key'}
-                </Text>
-              </View>
-            )}
           </View>
-
           {/* Theme picker */}
           <View style={styles.field}>
             <Text style={[styles.fieldLabel, { color: theme.textDim, fontFamily: FONTS.mono }]}>Theme</Text>

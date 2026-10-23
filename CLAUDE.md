@@ -1,84 +1,97 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for coding assistants and maintainers working on Cipher. Read [README.md](README.md) and [SECURITY.md](SECURITY.md) before changing authentication, encryption, or data flows.
 
 ## Commands
 
-```bash
-# Run dev server (then scan QR with Expo Go)
-npx expo start
+From the repository root:
 
-# Type-check (no emit) — run after any TS changes
-npx tsc --noEmit
-
-# Install Expo-aware package versions (handles peer-dep alignment)
-npx expo install <package>
-
-# Reset Metro cache if bundler misbehaves
+```sh
+npm ci
+npm start
+npm run type-check
+npm test
+npm run check:secrets
+npx expo install --check
 npx expo start --clear
 ```
 
-There is no test suite, no lint script, and no build step beyond Metro bundling.
+From `backend/`:
 
-When `npx expo install` fails on peer-dep conflicts (common with `react-native@0.81.5` requiring `react@19.1.0`), fall back to `npm install --legacy-peer-deps <pkg>` and pin the exact version Metro reports as expected for the SDK.
+```sh
+npm ci
+npm run dev
+npm run type-check
+npm test
+npm audit --omit=dev
+npm run build
+npm start
+```
+
+Root tests exercise extracted client security logic; backend tests compile TypeScript and run security regressions with Node's test runner. Provider requests are mocked. Native behavior still needs device testing. Keep dependency manifests and lockfiles synchronized; do not use peer-dependency bypass flags as a routine substitute for compatible versions.
+
+CI is defined in `.github/workflows/checks.yml`. The current-file secret-signature check does not cover all credential formats or Git history. Review the outstanding mobile dependency audit findings in `SECURITY.md`; do not claim they are all fixed or force a framework upgrade to clear them.
 
 ## SDK pinning
 
-The project is pinned to **Expo SDK 54** to match the user's Expo Go app version (54.0.2). Do **not** bump to SDK 55 or later — Expo Go on the user's phone won't load it. If `npx expo start` shows package version warnings, install the exact versions Metro reports rather than upgrading SDK.
+The project is pinned to **Expo SDK 54** for its existing mobile environment. Do not bump to SDK 55 or later as incidental maintenance. For native dependencies use `npx expo install <package>` and check compatibility with the current SDK. A native dependency change can require rebuilding the development client.
 
 ## Architecture
 
-**Single-vault encrypted chat app**, no backend — everything is local AsyncStorage encrypted with a password-derived key. The architecture is shaped by this constraint: there is no server, no socket, no message sync. "Other users" exist only as records in the same device's storage (so two accounts on the same device can chat with each other; that's it).
+This is a networked mobile app with an **Express + MongoDB backend**, not a local-only demo.
 
-### Data flow
+- `src/crypto.ts`: pure vault/message crypto helpers, PIN hashing, and standalone text/image tools. Vaults use PBKDF2-HMAC-SHA-256 at 100,000 iterations and AES-GCM. Direct-message payloads use a custom secp256k1 ECDH/AES-GCM construction.
+- `src/api.ts`: HTTP API boundary and shared response types. Production URLs must use HTTPS. The public mobile URL is configured by `EXPO_PUBLIC_API_URL`.
+- `src/db.ts`: signup/login, encrypted vault serialization, local ciphertext cache, and session persistence. Native session secrets use SecureStore; web sessions are memory-only. Legacy plaintext session material is removed.
+- `src/context/AppContext.tsx`: runtime vault, key, token, theme, sync, and app-lock state. Screens persist vault mutations through `updateVault` instead of writing storage directly.
+- `src/navigation/index.tsx`: authentication stack, first-run lock setup, lock screen, and main stack. The app-lock screen is a UI gate after vault decryption.
+- `src/screens/ChatScreen.tsx`: network messages and local assistant conversation. Network messages use long polling; the assistant calls the backend after consent.
+- `src/aiClient.ts`: no provider key or direct provider request. Uses authenticated `POST /ai/chat` via the application backend.
+- `backend/src/routes/`: authentication, encrypted vault storage, user lookup, requests, conversations, sync, push registration, and AI proxy.
+- `backend/src/events.ts`: in-process events used to wake long polls. This is not a distributed message broker.
+- `src/pushNotifications.ts` and `backend/src/push.ts`: Expo push registration/delivery with generic notification text and routing metadata.
 
-```
-password ──PBKDF2──► AES-GCM key ──► encrypts/decrypts ──► AsyncStorage
-                          │
-                          └─► held in memory by AppContext for the session
-```
+Conversation summaries and requests refresh in the foreground; open conversations use HTTP long polling, not WebSockets. Native push requires its own working build/project configuration.
 
-- `src/crypto.ts` — pure functions over `@noble/hashes` (PBKDF2, SHA-256) and `@noble/ciphers` (AES-GCM). All bytes ↔ base64 conversions live here. No I/O.
-- `src/db.ts` — the only module that touches AsyncStorage. Two key namespaces:
-  - `CIPHER_DB_USERS` — public user registry (id, salt, encrypted verifier, tagHash). Unencrypted JSON; safe because the verifier requires the password to decrypt.
-  - `CIPHER_VAULT_<userId>` — per-user encrypted blob containing profile + chats + contacts + settings. Decryptable only with that user's PBKDF2-derived key.
-  - `CIPHER_SESSION` — `{ userId, key: number[] }`. Lets the app skip re-deriving the key on app reload. **Note:** this stores the raw key in plaintext AsyncStorage; acceptable for a local-only demo, would need keychain/secure-store for production.
-- `src/context/AppContext.tsx` — the single source of truth at runtime. Holds `key`, `vault`, `theme`. All mutations go through `updateVault(newVault)` which re-encrypts and persists. **Never write to AsyncStorage directly from screens** — always go through context.
-- `src/navigation/index.tsx` — picks Auth stack vs Main stack based on `isAuthenticated`. No deep linking, no auth guards beyond this.
+## Authentication and persistent data
 
-### Theme system
+A domain-separated password-derived authentication credential is distinct from the vault key. The backend stores a scrypt hash of that credential and must verify it before issuing a JWT. `/auth/parameters` exposes derivation parameters, not a token. Authentication-version checks reject old tokens that were issued by the insecure username-only flow.
 
-`src/theme.ts` exports four named themes (cyan/magenta/amber/lime). Theme is a vault setting (persisted) and is rebuilt from `vault.settings.theme` on `updateVault`. Components receive `theme` as a prop or pull it from `useApp()`. There is no React context for theme alone — it's part of `AppContext`.
+Legacy accounts without an authentication credential fail closed. Do not invent a migration that enrolls a new credential based only on a username or old JWT. Preserve encrypted vaults and backups; recovery needs a separately reviewed proof of account ownership.
 
-### Crypto round-trip
+The encrypted vault holds the private messaging key and assistant history. Public account metadata, public keys, membership, reactions, and timestamps exist separately on the backend. Do not describe all server data as opaque ciphertext.
 
-Verifier check on login: encrypt the literal string `"CIPHER_OK"` at signup, store it; on login, derive key from password+salt, decrypt verifier, check it equals `"CIPHER_OK"`. AES-GCM auth tag means a wrong password fails decryption (caught and rethrown as "Incorrect password").
+Changes to vault formats, keys, account credentials, or token claims require a migration plan and regression tests. Never regenerate a private key or discard an undecryptable vault to make an error disappear.
 
-PBKDF2 iterations are **100k** (vs 150k in the original web prototype) — chosen for mobile JS performance. Don't lower further.
+## Privacy and secret handling
 
-## React Native input gotchas
+- Groq is the optional provider; it is not Grok/xAI or an Anthropic/Claude integration.
+- `GROQ_API_KEY` belongs only in backend secrets. The app must never accept, persist, or embed provider credentials.
+- AI conversation content is processed in plaintext by the backend and Groq. Keep the consent and privacy notice accurate. Never claim universal end-to-end encryption or provider zero retention.
+- No real secrets in example files, fixtures, logs, issue text, or commits. Do not reproduce previously leaked values while documenting an incident.
+- Removal from current source does not revoke a leaked credential or remove Git history. Refer operators to `SECURITY.md`.
 
-Several patterns silently break `TextInput` tap-to-focus on Android. The `Input` component in `src/components/Input.tsx` already accounts for these — replicate its pattern when adding new inputs:
+## Crypto limitations to preserve in documentation
 
-1. **Never** use `height: '100%'` on TextInput inside a fixed-height parent — collapses the tap region. Use `paddingVertical` on the wrapper + `padding: 0, margin: 0` on the TextInput.
-2. Wrap input rows in `TouchableWithoutFeedback` with a `useRef` calling `inputRef.current?.focus()` — the cursor-only tap target inside a styled View is too small.
-3. `KeyboardAvoidingView` should be `enabled={Platform.OS === 'ios'}` only. Android handles keyboard via `softwareKeyboardLayoutMode: "pan"` in `app.json`.
-4. Set `underlineColorAndroid="transparent"` and `textAlignVertical="center"` on every TextInput.
-5. Use `keyboardShouldPersistTaps="always"` (not `"handled"`) on ScrollView containing inputs.
+Do not equate strong primitives with a reviewed protocol. There is no authenticated key directory, key-change verification, cryptographic sender-signature protocol, or ratchet. New account fingerprints derive from public keys, but older records may use the previous account-value derivation; displayed peer fingerprints are not automatically trusted or verified. The image tool uses a versioned AES-GCM PNG carrier with random nonces and authenticated metadata; old unauthenticated CTR images are rejected. Never resize, convert to JPEG, or normalize encrypted carrier pixels before decryption. New standalone encryption requires at least 16-character keys; preserve old text decryption compatibility. Protocol changes require migration and tests, not stronger marketing claims.
+
+## Theme system
+
+`src/theme.ts` exports Cyan, Magenta, Amber, and Lime themes. The setting lives in the encrypted vault and is applied through `AppContext`. Components receive the theme or read it through `useApp()`.
+
+## React Native input behavior
+
+The shared `Input` component handles Android focus and keyboard quirks. Preserve its tested patterns:
+
+1. Avoid `height: '100%'` on `TextInput` within a fixed-height parent; use wrapper padding and explicit input padding.
+2. Keep the input ref and wrapper focus behavior when composing touchable input rows.
+3. Use `KeyboardAvoidingView` on iOS; Android uses `softwareKeyboardLayoutMode: "pan"` in `app.json`.
+4. Keep `underlineColorAndroid="transparent"`, `textAlignVertical="center"`, and suitable keyboard tap handling on scroll views.
 
 ## Crypto polyfills
 
-`@noble/ciphers` and `@noble/hashes` rely on `crypto.getRandomValues`. **Hermes does NOT provide it** — `react-native-get-random-values` is required and must be the **first import in `App.tsx`** (before anything that pulls in `@noble/*` transitively). Without this, signup/login throw "Property 'crypto' doesn't exist" at runtime.
+`react-native-get-random-values` must load before code that imports `@noble/*`. Preserve the first import in `App.tsx` and the existing text-decoder compatibility code. Do not replace this with a native crypto package without assessing Expo Go/development-client compatibility.
 
-`TextEncoder`, `TextDecoder`, `btoa`, `atob` ARE available in Hermes — no polyfill needed for those.
+## Scope and verification
 
-Do not replace this with `react-native-quick-crypto` (would require Expo dev build, not Expo Go).
-
-## What's missing (deliberate)
-
-- No real backend / WebSocket / federation — "users" are local records.
-- No message sync — adding a friend by `@tag` only finds users on the same device.
-- The Claude AI bot uses a hardcoded reply pool in `ChatScreen.tsx` (`AI_REPLIES`); no Anthropic API call.
-- No tests, no CI.
-
-If extending toward a real network app, the storage layer (`src/db.ts`) is the seam to replace — keep the `Vault`/`UserRecord` types and add a network adapter behind the same function signatures.
+Do not claim support for network groups/channels, network message editing/deletion, password recovery, or account deletion until implemented and tested. Check both mobile and backend TypeScript, run security tests, and manually test affected device flows. No passing test suite establishes complete cryptographic or production security.

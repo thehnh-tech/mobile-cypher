@@ -9,22 +9,49 @@ import { useApp } from '../context/AppContext';
 import { FONTS } from '../theme';
 import { LockIcon, ShieldIcon } from '../components/Icons';
 import { hashPin } from '../crypto';
+import { pinAttempts } from '../pinAttemptStorage';
+import { MAX_PIN_ATTEMPTS, PinAttemptState } from '../pinAttempts';
 
 const PIN_LENGTH = 4;
-const MAX_ATTEMPTS_BEFORE_DELAY = 5;
 
 export default function LockScreen() {
   const { theme, vault, unlock, logout } = useApp();
   const lockCfg = vault?.settings?.appLock;
+  const userId = vault?.profile.id;
   const isBiometric = !!lockCfg?.biometricEnabled;
 
   const [pin, setPin] = useState('');
   const [error, setError] = useState('');
-  const [attempts, setAttempts] = useState(0);
+  const [attemptState, setAttemptState] = useState<PinAttemptState>({ attempts: 0, blockedUntil: 0 });
+  const [attemptsReady, setAttemptsReady] = useState(false);
+  const [checkingPin, setCheckingPin] = useState(false);
+  const [now, setNow] = useState(Date.now());
   const [bioRunning, setBioRunning] = useState(false);
   const [bioCancelled, setBioCancelled] = useState(false);
   const pinRef = useRef<TextInput>(null);
   const autoTriedRef = useRef(false);
+  const checkingPinRef = useRef(false);
+  const secondsRemaining = Math.max(0, Math.ceil((attemptState.blockedUntil - now) / 1000));
+
+  useEffect(() => {
+    if (isBiometric || !userId) return;
+    let active = true;
+    setAttemptsReady(false);
+    pinAttempts.read(userId).then((state) => {
+      if (!active) return;
+      setAttemptState(state);
+      setAttemptsReady(true);
+    }).catch(() => {
+      if (active) setError('PIN protection is unavailable. Log out and sign in with your password.');
+    });
+    return () => { active = false; };
+  }, [isBiometric, userId]);
+
+  useEffect(() => {
+    if (!attemptState.blockedUntil) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [attemptState.blockedUntil]);
 
   const tryBiometric = useCallback(async () => {
     if (!isBiometric || bioRunning) return;
@@ -47,6 +74,9 @@ export default function LockScreen() {
       } else {
         setBioCancelled(true);
       }
+    } catch {
+      setError('Device authentication failed. Try again or log out.');
+      setBioCancelled(true);
     } finally {
       setBioRunning(false);
     }
@@ -63,31 +93,43 @@ export default function LockScreen() {
   }, [isBiometric, tryBiometric]);
 
   const submitPin = useCallback(
-    (digits: string) => {
-      if (!lockCfg || isBiometric) return;
+    async (digits: string) => {
+      if (!lockCfg || isBiometric || !userId || !attemptsReady || checkingPinRef.current) return;
       if (!lockCfg.pinHash || !lockCfg.salt) return;
       if (digits.length !== PIN_LENGTH) return;
-      const candidate = hashPin(digits, lockCfg.salt);
-      if (candidate === lockCfg.pinHash) {
-        setError('');
-        setAttempts(0);
-        unlock();
-      } else {
-        setAttempts((a) => a + 1);
-        setError('Incorrect PIN');
+      if (attemptState.blockedUntil > Date.now()) return;
+      checkingPinRef.current = true;
+      setCheckingPin(true);
+      try {
+        const nextState = await pinAttempts.begin(userId);
+        setAttemptState(nextState);
+        setNow(Date.now());
+        if (hashPin(digits, lockCfg.salt) === lockCfg.pinHash) {
+          await pinAttempts.clear(userId);
+          setError('');
+          unlock();
+        } else {
+          setError('Incorrect PIN');
+        }
+      } catch {
+        setAttemptsReady(false);
+        setError('PIN protection is unavailable. Log out and sign in with your password.');
+      } finally {
         setPin('');
+        checkingPinRef.current = false;
+        setCheckingPin(false);
       }
     },
-    [lockCfg, isBiometric, unlock],
+    [lockCfg, isBiometric, userId, attemptsReady, attemptState.blockedUntil, unlock],
   );
 
   const onChangePin = (s: string) => {
     const digits = s.replace(/[^0-9]/g, '').slice(0, PIN_LENGTH);
     setPin(digits);
-    if (digits.length === PIN_LENGTH) submitPin(digits);
+    if (digits.length === PIN_LENGTH) void submitPin(digits);
   };
 
-  const showLogout = isBiometric ? bioCancelled : attempts >= MAX_ATTEMPTS_BEFORE_DELAY;
+  const showLogout = isBiometric ? bioCancelled : !attemptsReady || attemptState.attempts >= MAX_PIN_ATTEMPTS;
 
   return (
     <View style={[styles.screen, { backgroundColor: theme.bg }]}>
@@ -138,6 +180,7 @@ export default function LockScreen() {
                   ref={pinRef}
                   value={pin}
                   onChangeText={onChangePin}
+                  editable={attemptsReady && !checkingPin && secondsRemaining === 0}
                   keyboardType="number-pad"
                   secureTextEntry
                   maxLength={PIN_LENGTH}
@@ -150,7 +193,11 @@ export default function LockScreen() {
               </>
             )}
 
-            {error ? (
+            {secondsRemaining > 0 ? (
+              <Text style={[styles.error, { color: theme.error, fontFamily: FONTS.body }]}>
+                Too many PIN attempts. Try again in {secondsRemaining}s, or log out and use your password.
+              </Text>
+            ) : error ? (
               <Text style={[styles.error, { color: theme.error, fontFamily: FONTS.body }]}>
                 {error}
               </Text>

@@ -24,15 +24,15 @@ import {
   base64ToBytes, bytesToBase64,
 } from '../crypto';
 
-const KEY_LENGTH_OPTIONS = [8, 16, 24, 32] as const;
-const MIN_KEY_LENGTH = 4;
+const KEY_LENGTH_OPTIONS = [16, 24, 32] as const;
+const MIN_KEY_LENGTH = 16;
 
 type Props = { navigation: StackNavigationProp<MainStackParams, 'Encryption'> };
 
 type Mode = 'encrypt' | 'decrypt';
 type InputType = 'text' | 'image';
 
-const MAX_IMAGE_DIM = 600; // cap so the AES-CTR + PNG encode stays snappy
+const MAX_IMAGE_DIM = 600; // cap so encryption and PNG encoding stay responsive
 
 interface ImageSlot {
   uri: string;       // file:// URI for <Image> rendering
@@ -84,18 +84,20 @@ export default function EncryptionScreen({ navigation }: Props) {
 
     setBusy(true);
     try {
-      // In encrypt mode, normalize and cap the size for performance. In
-      // decrypt mode, DO NOT resize — that would alter the encrypted pixels
-      // and break the round-trip. Format-convert to PNG either way (the user
-      // may have shared the encrypted image as JPEG by mistake, in which
-      // case decryption will produce garbage but at least the decode runs).
-      const actions =
-        mode === 'encrypt' ? [{ resize: { width: MAX_IMAGE_DIM } }] : [];
-      const manipulated = await ImageManipulator.manipulateAsync(
-        result.assets[0].uri,
-        actions,
-        { format: ImageManipulator.SaveFormat.PNG, base64: true },
-      );
+      // Keep encrypted carrier bytes untouched: resizing, JPEG conversion,
+      // or color conversion would invalidate authenticated pixel data.
+      const asset = result.assets[0];
+      const manipulated = mode === 'encrypt'
+        ? await ImageManipulator.manipulateAsync(
+            asset.uri,
+            asset.width > MAX_IMAGE_DIM ? [{ resize: { width: MAX_IMAGE_DIM } }] : [],
+            { format: ImageManipulator.SaveFormat.PNG, base64: true },
+          )
+        : {
+            width: asset.width,
+            height: asset.height,
+            base64: await FileSystem.readAsStringAsync(asset.uri, { encoding: FileSystem.EncodingType.Base64 }),
+          };
       if (!manipulated.base64) throw new Error('Manipulator did not return base64');
 
       const bytes = base64ToBytes(manipulated.base64);
@@ -180,7 +182,8 @@ export default function EncryptionScreen({ navigation }: Props) {
 
   const regenerateKey = () => setKey(generateKey(keyLength));
 
-  const validKeyLength = key.length >= MIN_KEY_LENGTH;
+  const requiredKeyLength = mode === 'encrypt' ? MIN_KEY_LENGTH : 4;
+  const validKeyLength = key.length >= requiredKeyLength;
 
   // Take the encrypt-mode output and feed it into decrypt-mode as input —
   // makes single-device round-trip demos painless.
@@ -222,7 +225,7 @@ export default function EncryptionScreen({ navigation }: Props) {
     // Defer the heavy work past the React commit so the spinner shows.
     InteractionManager.runAfterInteractions(async () => {
       try {
-        const result = transformImagePng(inputImage.bytes, key);
+        const result = transformImagePng(inputImage.bytes, key, mode);
         const b64 = bytesToBase64(result.bytes);
         fileCounter.current += 1;
         const path = `${FileSystem.cacheDirectory}cipher_out_${fileCounter.current}.png`;
@@ -248,7 +251,7 @@ export default function EncryptionScreen({ navigation }: Props) {
 
   const action = useCallback(() => {
     if (!validKeyLength) {
-      Alert.alert('Invalid key', `Key must be at least ${MIN_KEY_LENGTH} characters.`);
+      Alert.alert('Invalid key', `Key must be at least ${requiredKeyLength} characters.`);
       return;
     }
     if (inputType === 'text') {
@@ -256,7 +259,7 @@ export default function EncryptionScreen({ navigation }: Props) {
     } else {
       void runImageTransform();
     }
-  }, [validKeyLength, inputType, mode, textInput, textOutput, key, inputImage, runImageTransform]);
+  }, [validKeyLength, requiredKeyLength, inputType, mode, textInput, textOutput, key, inputImage, runImageTransform]);
 
   const actionLabel = mode === 'encrypt' ? 'Encrypt' : 'Decrypt';
 
@@ -447,7 +450,7 @@ export default function EncryptionScreen({ navigation }: Props) {
                 </Text>
               </TouchableOpacity>
               <Text style={[styles.hint, { color: theme.textDim, fontFamily: FONTS.mono }]}>
-                Capped at {MAX_IMAGE_DIM}px wide for speed · pixel-level AES-CTR
+                AES-GCM authenticated PNG · share the original PNG without resizing
               </Text>
             </View>
           )}

@@ -1,8 +1,7 @@
 import { Schema, model, InferSchemaType } from 'mongoose';
 
-// Public user record. Contains everything needed for the client to verify a
-// password locally (salt + verifier) and look up users by tag (tagHash).
-// The actual vault contents (messages, contacts, profile) live in Vault.
+// Public lookup fields plus a private, salted authentication hash. Legacy
+// records without authHash are intentionally unable to authenticate.
 const userSchema = new Schema(
   {
     username: { type: String, required: true, unique: true, lowercase: true, trim: true, index: true },
@@ -10,6 +9,7 @@ const userSchema = new Schema(
     tag: { type: String, required: true },
     tagHash: { type: String, required: true, unique: true, index: true },
     salt: { type: String, required: true },
+    authHash: { type: String, select: false },
     verifier: {
       iv: { type: String, required: true },
       ct: { type: String, required: true },

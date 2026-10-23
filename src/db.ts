@@ -1,18 +1,19 @@
 // Backend-aware data layer.
-// All vault contents are encrypted client-side (AES-GCM) before being sent
-// to the backend. The server stores opaque blobs only — it never sees
-// plaintext profiles, contacts, or messages.
+// Vault contents are encrypted client-side (AES-GCM). The backend separately
+// receives public profile/directory fields and messaging metadata. AI requests
+// send the selected conversation in plaintext to the backend and provider.
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
-  deriveKey, encryptData, decryptData,
+  deriveKey, deriveAuthCredential, encryptData, decryptData,
   randomSalt, randomId, sha256, fingerprint,
   generateECKeyPair,
   EncryptedBlob,
 } from './crypto';
-import { api } from './api';
+import { api, ApiError } from './api';
+import { secureSession } from './secureSession';
+import { stripLegacyAIKeys } from './vaultSanitizer';
 
-const SESSION_KEY = 'CIPHER_SESSION';
 const VAULT_CACHE_KEY = 'CIPHER_VAULT_CACHE';
 
 // ── Public types (unchanged from local-only version) ──────
@@ -94,15 +95,8 @@ export interface Vault {
   settings: {
     theme: string;
     bubbleStyle: string;
-    aiApiKey?: string;
     appLock?: AppLockConfig;
   };
-}
-
-interface SessionData {
-  userId: string;
-  key: number[];
-  token: string;
 }
 
 // ── Vault encryption helpers ──────────────────────────────
@@ -110,13 +104,13 @@ interface SessionData {
 // so the server stores a single opaque string.
 
 function packBlob(vault: Vault, key: Uint8Array): string {
-  const blob = encryptData(JSON.stringify(vault), key);
+  const blob = encryptData(JSON.stringify(stripLegacyAIKeys(vault)), key);
   return JSON.stringify(blob);
 }
 
 function unpackBlob(blobStr: string, key: Uint8Array): Vault {
   const blob: EncryptedBlob = JSON.parse(blobStr);
-  return JSON.parse(decryptData(blob, key));
+  return stripLegacyAIKeys(JSON.parse(decryptData(blob, key)));
 }
 
 // ── Auth operations ───────────────────────────────────────
@@ -131,7 +125,15 @@ export async function signup(params: {
   const finalTag = tag.toLowerCase().replace(/[^a-z0-9_.]/g, '');
   if (finalTag.length < 3) throw new Error('Tag must be at least 3 characters');
 
-  // Derive the key + verifier locally — never sent to the server.
+  if (!/^[a-zA-Z0-9_.-]{3,64}$/.test(username)) {
+    throw new Error('Username must be 3–64 letters, numbers, dots, underscores or hyphens');
+  }
+  if (password.length < 12 || password.length > 1024) {
+    throw new Error('Use a password of at least 12 characters');
+  }
+
+  // The vault key remains local; the independently derived authentication
+  // credential goes to the server over HTTPS and is stored only as a hash.
   const saltB64 = randomSalt();
   const key = deriveKey(password, saltB64);
   const verifier = encryptData('CIPHER_OK', key);
@@ -144,7 +146,7 @@ export async function signup(params: {
 
   // 1. Create the user on the server. Server returns its userId, we use it
   //    as profile.id inside the encrypted vault so external lookups match.
-  const fpSeed = sha256(`${username}:${saltB64}:${tagHash}`);
+  const fpSeed = sha256(ecKeys.publicKey);
   const fp = fingerprint(fpSeed);
 
   const signupResp = await api.signup({
@@ -156,6 +158,7 @@ export async function signup(params: {
     verifier,
     fingerprint: fp,
     publicKey: ecKeys.publicKey,
+    authCredential: deriveAuthCredential(password, saltB64),
   });
 
   const userId = signupResp.userId;
@@ -190,8 +193,8 @@ export async function signup(params: {
             from: 'cipher-ai',
             text:
               "Bienvenue sur Cipher 🔒\n\n" +
-              "Toutes tes conversations sont chiffrées de bout en bout (AES-256-GCM) avec une clé dérivée de ton mot de passe. " +
-              "Tes données sont 100% confidentielles : stockées chiffrées sur le serveur, aucun accès externe — ni développeurs, ni serveurs tiers ne voient le contenu.\n\n" +
+              "Ton coffre est chiffré sur ton appareil avant stockage. Les messages directs utilisent un chiffrement entre les appareils ; le serveur conserve les profils publics et les métadonnées. " +
+              "Les messages que tu m’envoies, ainsi que l’historique sélectionné, sont transmis en clair au backend et à Groq pour générer une réponse. L’assistant IA n’est pas chiffré de bout en bout.\n\n" +
               "Je suis Cipher, ton assistant. Comment puis-je t'aider aujourd'hui ?",
             ts: Date.now() - 60000,
           },
@@ -224,17 +227,21 @@ export async function login(params: {
 }): Promise<{ user: UserRecord; key: Uint8Array; vault: Vault; token: string }> {
   const { username, password } = params;
 
-  // 1. Ask server for {salt, verifier} so we can verify the password locally.
-  const loginResp = await api.login(username);
-  const key = deriveKey(password, loginResp.salt);
+  if (password.length > 1024) throw new Error('Password is too long');
+  // 1. Fetch public KDF parameters without obtaining an authenticated token.
+  const parameters = await api.authParameters(username);
+  const key = deriveKey(password, parameters.salt);
 
   let verified: string;
   try {
-    verified = decryptData(loginResp.verifier, key);
+    verified = decryptData(parameters.verifier, key);
   } catch {
     throw new Error('Incorrect password');
   }
   if (verified !== 'CIPHER_OK') throw new Error('Incorrect password');
+
+  // Server verification, not the local UI check, now gates JWT issuance.
+  const loginResp = await api.login(username, deriveAuthCredential(password, parameters.salt));
 
   // 2. Fetch encrypted vault.
   const { encryptedBlob } = await api.getVault(loginResp.token);
@@ -245,7 +252,7 @@ export async function login(params: {
     throw new Error('Failed to decrypt vault');
   }
 
-  await AsyncStorage.setItem(VAULT_CACHE_KEY, encryptedBlob);
+  await AsyncStorage.setItem(VAULT_CACHE_KEY, packBlob(vault, key));
 
   const user: UserRecord = {
     id: loginResp.userId,
@@ -292,8 +299,7 @@ export async function persistSession(
   key: Uint8Array,
   token: string,
 ): Promise<void> {
-  const session: SessionData = { userId, key: Array.from(key), token };
-  await AsyncStorage.setItem(SESSION_KEY, JSON.stringify(session));
+  await secureSession.set({ userId, key: Array.from(key), token });
 }
 
 export async function loadSession(): Promise<{
@@ -302,9 +308,8 @@ export async function loadSession(): Promise<{
   vault: Vault;
   token: string;
 } | null> {
-  const raw = await AsyncStorage.getItem(SESSION_KEY);
-  if (!raw) return null;
-  const session: SessionData = JSON.parse(raw);
+  const session = await secureSession.get();
+  if (!session) return null;
   const key = new Uint8Array(session.key);
 
   // Try to fetch the freshest vault from the backend; fall back to local cache
@@ -313,8 +318,12 @@ export async function loadSession(): Promise<{
   try {
     const { encryptedBlob } = await api.getVault(session.token);
     blobStr = encryptedBlob;
-    await AsyncStorage.setItem(VAULT_CACHE_KEY, blobStr);
-  } catch {
+  } catch (error) {
+    // Revoked/expired sessions must not be restored from an offline cache.
+    if (error instanceof ApiError && error.status < 500) {
+      await clearSession();
+      return null;
+    }
     blobStr = await AsyncStorage.getItem(VAULT_CACHE_KEY);
   }
 
@@ -322,6 +331,11 @@ export async function loadSession(): Promise<{
 
   try {
     const vault = unpackBlob(blobStr, key);
+    if (vault.profile.id !== session.userId) {
+      await clearSession();
+      return null;
+    }
+    await AsyncStorage.setItem(VAULT_CACHE_KEY, packBlob(vault, key));
     return { userId: session.userId, key, vault, token: session.token };
   } catch {
     return null;
@@ -329,5 +343,6 @@ export async function loadSession(): Promise<{
 }
 
 export async function clearSession(): Promise<void> {
-  await AsyncStorage.multiRemove([SESSION_KEY, VAULT_CACHE_KEY]);
+  await secureSession.clear();
+  await AsyncStorage.removeItem(VAULT_CACHE_KEY);
 }

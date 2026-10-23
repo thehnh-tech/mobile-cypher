@@ -1,3 +1,4 @@
+import 'express-async-errors';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -11,13 +12,16 @@ import requestsRoutes from './routes/requests';
 import conversationsRoutes from './routes/conversations';
 import syncRoutes from './routes/sync';
 import pushRoutes from './routes/push';
+import aiRoutes from './routes/ai';
 
 async function main() {
   await connectDB();
 
   const app = express();
   app.use(helmet());
-  app.use(cors()); // Open CORS — fine for local dev. Tighten in prod.
+  app.use(cors({
+    origin: config.nodeEnv === 'production' ? config.corsOrigins : true,
+  }));
   app.use(express.json({ limit: '4mb' })); // vault blobs can be larger than default 100kb
   app.use(morgan(config.nodeEnv === 'production' ? 'combined' : 'dev'));
 
@@ -30,10 +34,13 @@ async function main() {
   app.use('/conversations', conversationsRoutes);
   app.use('/sync', syncRoutes);
   app.use('/push', pushRoutes);
+  app.use('/ai', aiRoutes);
 
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-    console.error('[error]', err);
-    res.status(500).json({ error: err?.message ?? 'Internal server error' });
+    // Log a category only; parser/database errors can carry request data or credentials.
+    console.error('[error]', err?.name ?? 'Error');
+    const status = err?.status === 413 ? 413 : err?.status === 400 ? 400 : 500;
+    res.status(status).json({ error: status === 413 ? 'Request too large' : status === 400 ? 'Invalid request body' : 'Internal server error' });
   });
 
   // Listen on 0.0.0.0 so the phone on the same Wi-Fi can reach us via the PC's LAN IP.
@@ -43,6 +50,6 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.error('[fatal]', e);
+  console.error('[fatal]', e?.name ?? 'Startup failed');
   process.exit(1);
 });

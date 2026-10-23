@@ -13,7 +13,9 @@
       "supportsTablet": false,
       "bundleIdentifier": "com.cipher.app",
       "infoPlist": {
-        "UIBackgroundModes": ["remote-notification"]
+        "UIBackgroundModes": [
+          "remote-notification"
+        ]
       }
     },
     "android": {
@@ -31,7 +33,8 @@
         {
           "color": "#22d3ee"
         }
-      ]
+      ],
+      "expo-secure-store"
     ],
     "notification": {
       "color": "#22d3ee",

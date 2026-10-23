@@ -1,6 +1,6 @@
 import { pbkdf2 } from '@noble/hashes/pbkdf2';
 import { sha256 as sha256Noble } from '@noble/hashes/sha2';
-import { gcm, ctr } from '@noble/ciphers/aes';
+import { gcm } from '@noble/ciphers/aes';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { decode as decodePng, encode as encodePng } from 'fast-png';
 
@@ -38,6 +38,19 @@ export function deriveKey(password: string, saltB64: string): Uint8Array {
   const salt = fromBase64(saltB64);
   const pw = new TextEncoder().encode(password);
   return pbkdf2(sha256Noble, pw, salt, { c: 100_000, dkLen: 32 });
+}
+
+// A distinct PBKDF2 domain creates a password-equivalent server credential;
+// knowing it does not reveal the AES vault key. Transmit only over HTTPS.
+export function deriveAuthCredential(password: string, saltB64: string): string {
+  const label = new TextEncoder().encode('cipher:server-auth:v2:');
+  const accountSalt = fromBase64(saltB64);
+  const authSalt = new Uint8Array(label.length + accountSalt.length);
+  authSalt.set(label);
+  authSalt.set(accountSalt, label.length);
+  return toHex(pbkdf2(sha256Noble, new TextEncoder().encode(password), authSalt, {
+    c: 100_000, dkLen: 32,
+  }));
 }
 
 // ── Encryption / Decryption ────────────────────────────────
@@ -252,25 +265,15 @@ export function decryptStringWithKey16(combinedB64: string, key16: string): stri
 // Re-export for screens that need raw base64 conversion.
 export { toBase64 as bytesToBase64, fromBase64 as base64ToBytes };
 
-// ── Image scrambling (encryption tool) ─────────────────────
-//
-// Symmetric pixel-level cipher. Input PNG → decode to raw RGBA → AES-CTR
-// stream cipher XORs every byte → re-encode as PNG. Same operation in
-// reverse decrypts (CTR is symmetric: encrypt = decrypt). Because CTR is
-// length-preserving, the output is also a valid PNG of the same dimensions
-// — the user sees a scrambled-looking image they can save / share.
-//
-// Nonce is deterministically derived from the key so the round-trip
-// (encrypt → save → reopen → decrypt) reproduces the original. This is a
-// CTR-key-reuse trade-off acceptable here because the key is single-use
-// per image; for production messaging you'd use a random nonce stored
-// alongside the ciphertext.
-
-function deriveAesCtrParams(key16: string): { key: Uint8Array; nonce: Uint8Array } {
-  const key = sha256Noble(new TextEncoder().encode(key16));
-  const nonce = sha256Noble(new TextEncoder().encode(`${key16}:nonce`)).slice(0, 16);
-  return { key, nonce };
-}
+// ── Authenticated image encryption ─────────────────────────
+// The PNG is a lossless carrier for a versioned header and AES-GCM
+// ciphertext. Opaque RGB pixels prevent alpha premultiplication from
+// changing encrypted bytes when the image is saved. Every encryption uses
+// a fresh random nonce; decryption authenticates before decoding the image.
+const IMAGE_MAGIC = new TextEncoder().encode('CIPHPNG2');
+const IMAGE_HEADER_LENGTH = 32;
+const MAX_IMAGE_BYTES = 16 * 1024 * 1024;
+const MAX_IMAGE_PIXELS = 8_000_000;
 
 export interface ImageEncryptionResult {
   bytes: Uint8Array;  // PNG file bytes
@@ -278,74 +281,84 @@ export interface ImageEncryptionResult {
   height: number;
 }
 
-// Encrypt or decrypt a PNG with the given 16-char key. CTR is symmetric so
-// this single function handles both directions. Backed by `fast-png` (uses
-// `fflate`); previous attempt with `upng-js` had a Hermes incompatibility
-// where its toRGBA8 path failed for certain depth/channel combinations.
+function decodeBoundedPng(bytes: Uint8Array): ReturnType<typeof decodePng> {
+  if (!bytes || bytes.length < 33 || bytes.length > MAX_IMAGE_BYTES) {
+    throw new Error('Empty, truncated, or oversized PNG input');
+  }
+  const signature = [137, 80, 78, 71, 13, 10, 26, 10];
+  if (!signature.every((value, index) => bytes[index] === value)) {
+    throw new Error('A lossless PNG file is required');
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const width = view.getUint32(16);
+  const height = view.getUint32(20);
+  if (!width || !height || width * height > MAX_IMAGE_PIXELS) {
+    throw new Error('PNG dimensions exceed the supported limit');
+  }
+  const decoded = decodePng(bytes);
+  if (decoded.depth !== 8 || (decoded.channels !== 3 && decoded.channels !== 4)) {
+    throw new Error('An 8-bit RGB or RGBA PNG is required');
+  }
+  return decoded;
+}
+
 export function transformImagePng(
   pngBytes: Uint8Array,
   key16: string,
+  mode: 'encrypt' | 'decrypt',
 ): ImageEncryptionResult {
-  if (!pngBytes || pngBytes.byteLength < 16) {
-    throw new Error('Empty or truncated PNG input');
+  if (key16.length < 16) throw new Error('Image encryption keys must contain at least 16 characters');
+  const decoded = decodeBoundedPng(pngBytes);
+  const key = deriveAesKeyFromString(key16);
+  if (mode === 'encrypt') {
+    if (pngBytes.length > 12 * 1024 * 1024) throw new Error('Image is too large to encrypt');
+    const width = Math.min(600, Math.max(16, decoded.width));
+    const ciphertextLength = pngBytes.length + 16;
+    const height = Math.ceil((IMAGE_HEADER_LENGTH + ciphertextLength) / (width * 3));
+    const header = new Uint8Array(IMAGE_HEADER_LENGTH);
+    header.set(IMAGE_MAGIC);
+    const iv = randomBytes(12);
+    header.set(iv, 8);
+    const view = new DataView(header.buffer);
+    view.setUint32(20, ciphertextLength);
+    view.setUint32(24, width);
+    view.setUint32(28, height);
+    const ciphertext = gcm(key, iv, header).encrypt(pngBytes);
+    const data = new Uint8Array(width * height * 3);
+    data.set(header);
+    data.set(ciphertext, IMAGE_HEADER_LENGTH);
+    return { bytes: encodePng({ width, height, data, depth: 8, channels: 3 }), width, height };
   }
 
-  let decoded: ReturnType<typeof decodePng>;
-  try {
-    decoded = decodePng(pngBytes);
-  } catch (e: any) {
-    throw new Error(`PNG decode failed: ${e?.message ?? String(e)}`);
-  }
-
-  if (decoded.depth !== 8) {
-    throw new Error(`Unsupported PNG depth ${decoded.depth} (expected 8)`);
-  }
-
-  // Normalize to 32-bit RGBA — fast-png decodes 3-channel PNGs as RGB and
-  // 4-channel as RGBA; we always encrypt over 4 channels so the cipher
-  // round-trips uniformly regardless of source.
-  let rgba: Uint8Array;
-  if (decoded.channels === 4) {
-    rgba =
-      decoded.data instanceof Uint8Array
-        ? new Uint8Array(decoded.data) // copy so we don't mutate the decoder's buffer
-        : new Uint8Array(decoded.data.buffer.slice(0));
-  } else if (decoded.channels === 3) {
-    const total = decoded.width * decoded.height;
-    rgba = new Uint8Array(total * 4);
-    const src = decoded.data as Uint8Array;
-    for (let i = 0, j = 0; i < total; i++, j += 4) {
-      const k = i * 3;
-      rgba[j] = src[k];
-      rgba[j + 1] = src[k + 1];
-      rgba[j + 2] = src[k + 2];
-      rgba[j + 3] = 255;
+  const pixels = decoded.data as Uint8Array;
+  const data = new Uint8Array(decoded.width * decoded.height * 3);
+  for (let source = 0, target = 0; target < data.length; source += decoded.channels, target += 3) {
+    if (decoded.channels === 4 && pixels[source + 3] !== 255) {
+      throw new Error('Encrypted PNG was modified; transparency is not supported');
     }
-  } else {
-    throw new Error(`Unsupported PNG channels ${decoded.channels}`);
+    data.set(pixels.subarray(source, source + 3), target);
   }
-
-  const { key, nonce } = deriveAesCtrParams(key16);
-  const transformed = ctr(key, nonce).encrypt(rgba);
-
-  let encoded: Uint8Array;
+  if (data.length < IMAGE_HEADER_LENGTH + 16 || !IMAGE_MAGIC.every((value, index) => data[index] === value)) {
+    throw new Error('Unsupported encrypted image. Legacy image scrambling cannot be decrypted securely.');
+  }
+  const header = data.slice(0, IMAGE_HEADER_LENGTH);
+  const view = new DataView(header.buffer);
+  const ciphertextLength = view.getUint32(20);
+  if (view.getUint32(24) !== decoded.width || view.getUint32(28) !== decoded.height ||
+      ciphertextLength < 16 || ciphertextLength > data.length - IMAGE_HEADER_LENGTH ||
+      data.subarray(IMAGE_HEADER_LENGTH + ciphertextLength).some((byte) => byte !== 0)) {
+    throw new Error('Encrypted PNG is truncated or modified');
+  }
+  let plaintext: Uint8Array;
   try {
-    encoded = encodePng({
-      width: decoded.width,
-      height: decoded.height,
-      data: transformed,
-      depth: 8,
-      channels: 4,
-    });
-  } catch (e: any) {
-    throw new Error(`PNG encode failed: ${e?.message ?? String(e)}`);
+    plaintext = gcm(key, header.slice(8, 20), header).decrypt(
+      data.slice(IMAGE_HEADER_LENGTH, IMAGE_HEADER_LENGTH + ciphertextLength),
+    );
+  } catch {
+    throw new Error('Image authentication failed: incorrect key or modified image');
   }
-
-  return {
-    bytes: encoded,
-    width: decoded.width,
-    height: decoded.height,
-  };
+  const original = decodeBoundedPng(plaintext);
+  return { bytes: plaintext, width: original.width, height: original.height };
 }
 
 // ── PIN hashing (app lock) ─────────────────────────────────

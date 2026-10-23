@@ -6,7 +6,7 @@ const router = Router();
 router.use(authMiddleware);
 
 // GET /users/by-tag/:tag — find a user by hashed tag for friend search.
-// Client sends the SHA-256 of the desired tag (privacy: server never sees raw tags).
+// Lookup uses a SHA-256 index. Raw tags are also stored as public account metadata.
 router.get('/by-tag/:tagHash', async (req: Request, res: Response) => {
   const { tagHash } = req.params;
   if (!tagHash) return res.status(400).json({ error: 'Missing tagHash' });
